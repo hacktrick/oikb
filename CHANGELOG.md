@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Confluence blog posts and Markdown**: `content=blogs` or `content=all` syncs blog posts under `Blogs/`, and under `Blogs/YEAR/` when `structure=hierarchical`. `format=markdown` exports pages and posts as Markdown (`pip install oikb[confluence]`). A bare `confluence:SPACE` source still syncs pages to the Knowledge Base root as plain text. With `content=all`, pages are prefixed with `Pages/` so they stay distinct from blog posts.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added

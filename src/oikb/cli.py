@@ -119,7 +119,9 @@ def _resolve_connector(
             user=auth.get("user"),
             token=auth.get("token"),
             api_version=auth.get("api_version"),
-            structure=parsed.get("structure", "flat"),
+            structure=parsed.get("structure") or "flat",
+            content=parsed.get("content") or "pages",
+            fmt=parsed.get("format") or "text",
         )
 
     if source.startswith("notion:"):

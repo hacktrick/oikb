@@ -13,6 +13,8 @@ def test_parse_hierarchical_source() -> None:
         "base_url": None,
         "space_key": "ABC",
         "structure": "hierarchical",
+        "content": "pages",
+        "format": "text",
     }
 
 
@@ -23,6 +25,8 @@ def test_parse_url_source_with_structure() -> None:
         "base_url": "https://company.atlassian.net",
         "space_key": "ABC",
         "structure": "hierarchical",
+        "content": "pages",
+        "format": "text",
     }
 
 
@@ -31,6 +35,8 @@ def test_parse_url_source_with_structure() -> None:
     [
         "confluence:ABC?structure=invalid",
         "confluence:ABC?unexpected=value",
+        "confluence:ABC?content=nope",
+        "confluence:ABC?format=rtf",
     ],
 )
 def test_parse_rejects_invalid_structure(source: str) -> None:
@@ -284,6 +290,191 @@ def test_source_context_path_and_invalid_version():
     assert parse_confluence_source("confluence:https://wiki.example/confluence/ENG")["base_url"] == "https://wiki.example/confluence"
     with pytest.raises(ValueError, match="API_VERSION"):
         ConfluenceConnector("ENG", api_version="v3")
+
+
+@respx.mock
+def test_parse_content_and_format():
+    assert parse_confluence_source(
+        "confluence:ENG?content=all&format=markdown&structure=hierarchical"
+    ) == {
+        "base_url": None,
+        "space_key": "ENG",
+        "structure": "hierarchical",
+        "content": "all",
+        "format": "markdown",
+    }
+
+
+def test_markdown_format_requires_extra(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fail_markdownify(name, *args, **kwargs):
+        if name == "markdownify":
+            raise ImportError("no markdownify")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_markdownify)
+    with pytest.raises(ImportError, match=r"oikb\[confluence\]"):
+        ConfluenceConnector("ENG", base_url="https://wiki.example", token="pat", fmt="markdown")
+
+
+@respx.mock
+def test_blogposts_use_year_folders_only_when_hierarchical():
+    posts = [{
+        "id": "9",
+        "title": "Weekly Update",
+        "createdAt": "2024-05-02T10:00:00.000Z",
+        "version": {"number": 3},
+    }]
+    respx.get("https://test.atlassian.net/wiki/api/v2/spaces/123/blogposts").mock(
+        return_value=httpx.Response(200, json={"results": posts})
+    )
+
+    flat = ConfluenceConnector(
+        "123", base_url="https://test.atlassian.net", token="pat", content="blogs"
+    )
+    hierarchical = ConfluenceConnector(
+        "123",
+        base_url="https://test.atlassian.net",
+        token="pat",
+        content="blogs",
+        structure="hierarchical",
+    )
+    try:
+        assert [e.display_path for e in flat.build_manifest()] == ["Blogs/Weekly Update.txt"]
+        assert [e.display_path for e in hierarchical.build_manifest()] == [
+            "Blogs/2024/Weekly Update.txt"
+        ]
+    finally:
+        flat.close()
+        hierarchical.close()
+
+
+@respx.mock
+def test_all_content_keeps_pages_and_blogs_apart():
+    respx.get("https://test.atlassian.net/wiki/api/v2/spaces/123/pages").mock(
+        return_value=httpx.Response(200, json={"results": _pages()})
+    )
+    respx.get("https://test.atlassian.net/wiki/api/v2/spaces/123/blogposts").mock(
+        return_value=httpx.Response(200, json={"results": [{
+            "id": "9",
+            "title": "Weekly Update",
+            "createdAt": "2024-05-02T10:00:00.000Z",
+            "version": {"number": 1},
+        }]})
+    )
+    connector = ConfluenceConnector(
+        "123",
+        base_url="https://test.atlassian.net",
+        token="pat",
+        content="all",
+        structure="hierarchical",
+    )
+    try:
+        assert [e.display_path for e in connector.build_manifest()] == [
+            "Blogs/2024/Weekly Update.txt",
+            "Pages/FAQ.txt",
+            "Pages/FAQ/Benefits.txt",
+            "Pages/Internal Notes.txt",
+        ]
+    finally:
+        connector.close()
+
+
+@respx.mock
+def test_bare_source_still_syncs_pages_at_root():
+    respx.get("https://test.atlassian.net/wiki/api/v2/spaces/123/pages").mock(
+        return_value=httpx.Response(200, json={"results": _pages()})
+    )
+    connector = ConfluenceConnector("123", base_url="https://test.atlassian.net", token="pat")
+    try:
+        assert [e.path for e in connector.build_manifest()] == ["", "", ""]
+    finally:
+        connector.close()
+
+
+@respx.mock
+def test_markdown_export_and_code_macro():
+    pytest.importorskip("markdownify")
+    respx.get("https://test.atlassian.net/wiki/api/v2/spaces/123/pages").mock(
+        return_value=httpx.Response(200, json={"results": [{
+            "id": "2", "title": "Benefits", "version": {"number": 1},
+        }]})
+    )
+    storage = (
+        "<h1>Title</h1><p>Hello</p>"
+        '<ac:structured-macro ac:name="code">'
+        '<ac:parameter ac:name="language">python</ac:parameter>'
+        "<ac:plain-text-body><![CDATA[print(1)]]></ac:plain-text-body>"
+        "</ac:structured-macro>"
+        '<ac:image><ri:attachment ri:filename="diagram.png" /></ac:image>'
+    )
+    respx.get("https://test.atlassian.net/wiki/api/v2/pages/2").mock(
+        return_value=httpx.Response(200, json={"body": {"storage": {"value": storage}}})
+    )
+    connector = ConfluenceConnector(
+        "123", base_url="https://test.atlassian.net", token="pat", fmt="markdown"
+    )
+    try:
+        manifest = connector.build_manifest()
+        assert [e.display_path for e in manifest] == ["Benefits.md"]
+        body = connector.read_file("", "Benefits.md").decode()
+    finally:
+        connector.close()
+    assert body.startswith("# Title")
+    assert "```python" in body
+    assert "print(1)" in body
+    assert "diagram.png" in body
+
+
+@respx.mock
+def test_malformed_record_is_skipped():
+    respx.get("https://test.atlassian.net/wiki/api/v2/spaces/123/pages").mock(
+        return_value=httpx.Response(200, json={"results": [
+            {"id": "1", "title": "FAQ", "version": {"number": 1}},
+            {"id": "2", "version": {"number": 1}},
+        ]})
+    )
+    connector = ConfluenceConnector("123", base_url="https://test.atlassian.net", token="pat")
+    try:
+        assert [e.display_path for e in connector.build_manifest()] == ["FAQ.txt"]
+    finally:
+        connector.close()
+
+
+@respx.mock
+def test_v1_blogposts_read_created_year(monkeypatch):
+    monkeypatch.setenv("CONFLUENCE_API_VERSION", "v1")
+    monkeypatch.setenv("CONFLUENCE_USER", "")
+
+    def respond(request):
+        if request.url.params.get("type") == "blogpost":
+            return httpx.Response(200, json={"results": [{
+                "id": "9",
+                "title": "Weekly Update",
+                "history": {"createdDate": "2023-01-04T00:00:00.000Z"},
+                "version": {"number": 1},
+            }]})
+        return httpx.Response(200, json={"results": []})
+
+    route = respx.get("https://wiki.example/rest/api/content").mock(side_effect=respond)
+    respx.get("https://wiki.example/rest/api/content/9").respond(
+        200, json={"body": {"storage": {"value": "<p>Hello</p>"}}}
+    )
+    with ConfluenceConnector(
+        "ENG",
+        base_url="https://wiki.example",
+        token="pat",
+        content="blogs",
+        structure="hierarchical",
+    ) as connector:
+        manifest = connector.build_manifest()
+        assert [e.display_path for e in manifest] == ["Blogs/2023/Weekly Update.txt"]
+        assert connector.read_file("Blogs/2023", "Weekly Update.txt") == b"Hello"
+    assert route.calls[0].request.url.params["type"] == "blogpost"
+    assert route.calls[0].request.url.params["expand"] == "history,version"
 
 
 @respx.mock

@@ -154,13 +154,14 @@ services:
 ```bash
 oikb sync github:owner/repo --kb-id your-kb-id
 oikb sync confluence:ENG --kb-id your-kb-id
+oikb sync 'confluence:ENG?content=all&format=markdown' --kb-id your-kb-id
 oikb sync s3://bucket/prefix --kb-id your-kb-id
 oikb sync nextcloud:/Documents --kb-id your-kb-id
 oikb sync servicenow:incident --kb-id your-kb-id
 oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
 ```
 
-Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, or `pip install oikb[all]` for everything.
+Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, `pip install oikb[confluence]` (Markdown export), or `pip install oikb[all]` for everything.
 
 ### Gitea
 

@@ -30,6 +30,7 @@ gdrive = ["google-api-python-client>=2.100", "google-auth>=2.25"]
 gmail = ["google-api-python-client>=2.100", "google-auth>=2.25"]
 gsites = ["google-api-python-client>=2.100", "google-auth>=2.25"]
 web = ["beautifulsoup4>=4.12"]
+confluence = ["markdownify>=0.13", "beautifulsoup4>=4.12"]
 oracle = ["oci"]
 sharepoint-cert = ["cryptography>=42.0", "PyJWT>=2.8"]
 # PyMuPDF 2.x requires onnxruntime, which has no Alpine (musl) distribution.
@@ -42,13 +43,20 @@ all = [
     "google-api-python-client>=2.100",
     "google-auth>=2.25",
     "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
     "oci",
     "cryptography>=42.0",
     "PyJWT>=2.8",
     "pyzotero>=1.5",
     "pymupdf>=1.24,<2",
 ]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "markdownify>=0.13",
+    "beautifulsoup4>=4.12",
+]
 
 [project.scripts]
 oikb = "oikb.cli:cli"

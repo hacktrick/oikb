@@ -63,7 +63,7 @@ For specific connectors with extra dependencies:
 ```bash
 pip install oikb[gdrive]     # Google Drive
 pip install oikb[s3]         # AWS S3
-pip install oikb[confluence] # Confluence
+pip install oikb[confluence] # Confluence Markdown export
 pip install oikb[all]        # Everything
 ```
 
@@ -395,7 +395,20 @@ oikb sync confluence:SPACE_KEY --kb-id your-kb-id
 
 # Preserve the Confluence page hierarchy in manifest paths.
 oikb sync 'confluence:SPACE_KEY?structure=hierarchical' --kb-id your-kb-id
+
+# Pages and blog posts, as Markdown. Blog posts land under Blogs/,
+# and under Blogs/YEAR/ when structure=hierarchical.
+# Pages stay at the KB root unless content=all, which prefixes them
+# with Pages/ so they do not collide with blog posts.
+oikb sync 'confluence:SPACE_KEY?content=all&format=markdown&structure=hierarchical' --kb-id your-kb-id
 ```
+
+`content` is `pages` (default), `blogs`, or `all`. `format` is `text`
+(default) or `markdown`. A bare `confluence:SPACE` source still syncs
+pages to the KB root as plain text. Markdown export needs
+`pip install oikb[confluence]` (markdownify). Headings, lists, tables,
+and links convert directly. Code macros become fenced blocks, and
+images are referenced by filename. Other macros keep their inner text.
 
 With hierarchical structure enabled, existing `filter.include` and
 `filter.exclude` patterns can select page trees, for example

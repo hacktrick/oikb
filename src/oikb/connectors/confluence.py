@@ -3,12 +3,17 @@
 Supports Cloud REST API v2 (default) and Server/Data Center REST API v1.
 Set CONFLUENCE_API_VERSION=v1 for Server/Data Center. Authentication uses
 Basic auth with CONFLUENCE_USER, or Bearer auth when only a token is supplied.
+
+Pages are exported as plain text by default. Blog posts are optional
+(``content=blogs`` or ``content=all``). ``format=markdown`` needs the
+``oikb[confluence]`` extra.
 """
 
 from __future__ import annotations
 
 import hashlib
 import html
+import logging
 import os
 import re
 from collections import Counter
@@ -19,6 +24,8 @@ from urllib.parse import parse_qsl, urlsplit
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry, SourceFileUnavailable
+
+log = logging.getLogger(__name__)
 
 # A link's visible label is the title of another page in the space, which syncs
 # as its own file. Dropped with the link so a section index does not become a
@@ -70,8 +77,80 @@ def _storage_to_text(storage_html: str) -> str:
     return _PARKED.sub(lambda m: parked[int(m.group(1))].strip(), text).strip()
 
 
+def _storage_to_markdown(storage_html: str) -> str:
+    """Convert Confluence storage XHTML to Markdown.
+
+    ``markdownify`` handles headings, lists, tables, and links. A short
+    pre-pass turns code macros into fenced blocks and attachment images
+    into filename references. Other macros keep their inner text.
+    """
+    from markdownify import markdownify
+
+    normalized = _normalize_confluence_macros(storage_html)
+    return markdownify(
+        normalized,
+        heading_style="ATX",
+        bullets="-",
+        code_language_callback=_code_language,
+    ).strip()
+
+
+def _code_language(el: Any) -> str:
+    code = el.find("code")
+    node = code if code is not None else el
+    classes = node.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    for name in classes:
+        if name.startswith("language-"):
+            return name.removeprefix("language-")
+    return ""
+
+
+def _normalize_confluence_macros(storage_html: str) -> str:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(storage_html or "", "html.parser")
+    for macro in soup.find_all("ac:structured-macro", attrs={"ac:name": "code"}):
+        _rewrite_code_macro(soup, macro)
+    for image in soup.find_all("ac:image"):
+        _rewrite_image_macro(soup, image)
+    return str(soup)
+
+
+def _rewrite_code_macro(soup: Any, macro: Any) -> None:
+    language = ""
+    for param in macro.find_all("ac:parameter"):
+        if param.get("ac:name") == "language" and param.string:
+            language = param.string.strip()
+    body = macro.find("ac:plain-text-body")
+    code_text = body.get_text() if body else ""
+    pre = soup.new_tag("pre")
+    code = soup.new_tag("code")
+    if language:
+        code["class"] = f"language-{language}"
+    code.string = code_text
+    pre.append(code)
+    macro.replace_with(pre)
+
+
+def _rewrite_image_macro(soup: Any, image: Any) -> None:
+    filename = "image"
+    attachment = image.find("ri:attachment")
+    if attachment is not None and attachment.get("ri:filename"):
+        filename = attachment["ri:filename"]
+    image.replace_with(soup.new_tag("img", alt=filename, src=filename))
+
+
+def _created_year(item: dict[str, Any]) -> str:
+    created = item.get("createdAt") or (item.get("history") or {}).get("createdDate") or ""
+    if len(created) >= 4 and created[:4].isdigit():
+        return created[:4]
+    return "unknown"
+
+
 class ConfluenceConnector(BaseConnector):
-    """Sync pages from a Confluence space.
+    """Sync pages, and optionally blog posts, from a Confluence space.
 
     Args:
         space_key: Confluence space key (e.g. "ENG").
@@ -79,6 +158,8 @@ class ConfluenceConnector(BaseConnector):
         user:      Confluence user email (or CONFLUENCE_USER env var).
         token:     Confluence API token (or CONFLUENCE_TOKEN env var).
         structure: "flat" or "hierarchical" manifest paths.
+        content:   "pages" (default), "blogs", or "all".
+        fmt:       "text" (default) or "markdown".
         api_version: "v1" or "v2" (or CONFLUENCE_API_VERSION, default "v2").
     """
 
@@ -89,12 +170,28 @@ class ConfluenceConnector(BaseConnector):
         user: str | None = None,
         token: str | None = None,
         structure: str = "flat",
+        content: str = "pages",
+        fmt: str = "text",
         api_version: str | None = None,
     ):
         if structure not in {"flat", "hierarchical"}:
             raise ValueError("structure must be 'flat' or 'hierarchical'")
+        if content not in {"pages", "blogs", "all"}:
+            raise ValueError("content must be 'pages', 'blogs', or 'all'")
+        if fmt not in {"text", "markdown"}:
+            raise ValueError("format must be 'text' or 'markdown'")
+        if fmt == "markdown":
+            try:
+                import markdownify  # noqa: F401
+            except ImportError as exc:
+                raise ImportError(
+                    "Markdown export requires markdownify. "
+                    "Install with: pip install oikb[confluence]"
+                ) from exc
         self.space_key = space_key
         self.structure = structure
+        self.content = content
+        self.format = fmt
         self._api_version = (api_version or os.environ.get("CONFLUENCE_API_VERSION", "v2")).lower()
         if self._api_version not in {"v1", "v2"}:
             raise ValueError("CONFLUENCE_API_VERSION must be 'v1' or 'v2'")
@@ -147,34 +244,86 @@ class ConfluenceConnector(BaseConnector):
                 self._http.close()
                 raise
 
-        # Cache page content for read_file.
-        self._page_cache: dict[str, str] = {}
+        # display_path -> (kind, id). Kind selects the read_file endpoint.
+        self._content_cache: dict[str, tuple[str, str]] = {}
 
     def build_manifest(self) -> list[ManifestEntry]:
-        """List all pages in the space and build a manifest."""
-        self._page_cache.clear()
-        pages: list[dict[str, Any]] = []
+        """List pages and/or blog posts in the space and build a manifest."""
+        self._content_cache.clear()
+        records: list[tuple[str, dict[str, Any]]] = []
+        if self.content in {"pages", "all"}:
+            records.extend(("page", page) for page in self._list_content("page"))
+        if self.content in {"blogs", "all"}:
+            records.extend(("blogpost", post) for post in self._list_content("blogpost"))
+
+        pages_by_id = {
+            str(raw["id"]): raw
+            for kind, raw in records
+            if kind == "page" and raw.get("id") is not None
+        }
+        built: list[tuple[str, dict[str, Any], ManifestEntry]] = []
+        for kind, raw in records:
+            try:
+                built.append((kind, raw, self._entry(kind, raw, pages_by_id)))
+            except (KeyError, TypeError) as exc:
+                log.warning(
+                    "Skipping malformed Confluence %s record: %s: %r",
+                    "page" if kind == "page" else "blog post",
+                    exc,
+                    raw,
+                )
+
+        entries = [entry for _, _, entry in built]
+        counts = Counter(entry.display_path for entry in entries)
+        reserved = set(counts)
+        for index, (kind, raw, entry) in enumerate(built):
+            if counts[entry.display_path] > 1:
+                # Rename every colliding title so API ordering cannot change identity.
+                stem, ext = os.path.splitext(entry.filename)
+                stem = f"{stem}_{raw['id']}"
+                candidate = replace(entry, filename=f"{stem}{ext}")
+                while candidate.display_path in reserved:
+                    stem += "_"
+                    candidate = replace(entry, filename=f"{stem}{ext}")
+                entry = candidate
+                reserved.add(entry.display_path)
+            entries[index] = entry
+            self._content_cache[entry.display_path] = (kind, str(raw["id"]))
+        entries.sort(key=lambda e: e.display_path)
+        return entries
+
+    def _list_content(self, kind: str) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"limit": 250}
-        endpoint = f"/api/v2/spaces/{self.space_key}/pages"
         if self._api_version == "v1":
             endpoint = "/rest/api/content"
-            params.update(spaceKey=self.space_key, type="page", start=0, expand="ancestors,version")
-        seen_pages: set[str] = set()
+            expand = "ancestors,version" if kind == "page" else "history,version"
+            params.update(
+                spaceKey=self.space_key,
+                type="page" if kind == "page" else "blogpost",
+                start=0,
+                expand=expand,
+            )
+        elif kind == "page":
+            endpoint = f"/api/v2/spaces/{self.space_key}/pages"
+        else:
+            endpoint = f"/api/v2/spaces/{self.space_key}/blogposts"
 
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        label = "page" if kind == "page" else "blog post"
         while True:
             resp = self._http.get(endpoint, params=params)
             resp.raise_for_status()
             data = resp.json()
 
             results = data["results"]
-            for page in results:
-                page_id = str(page["id"])
-                if page_id in seen_pages:
-                    raise ValueError(f"Repeated Confluence page in pagination: {page_id}")
-                seen_pages.add(page_id)
-            pages.extend(results)
+            for item in results:
+                item_id = str(item["id"])
+                if item_id in seen:
+                    raise ValueError(f"Repeated Confluence {label} in pagination: {item_id}")
+                seen.add(item_id)
+            items.extend(results)
 
-            # Handle pagination.
             next_link = data.get("_links", {}).get("next")
             if not next_link:
                 break
@@ -186,35 +335,32 @@ class ConfluenceConnector(BaseConnector):
             if parameter == "start" and int(next_value) <= int(params["start"]):
                 raise ValueError("Confluence pagination did not advance")
             params[parameter] = next_value
+        return items
 
-        pages_by_id = {str(page["id"]): page for page in pages}
-        entries = [self._page_entry(page, pages_by_id) for page in pages]
-        counts = Counter(entry.display_path for entry in entries)
-        reserved = set(counts)
-        for index, (page, entry) in enumerate(zip(pages, entries)):
-            if counts[entry.display_path] > 1:
-                # Rename every colliding title so API ordering cannot change identity.
-                stem = entry.filename.removesuffix(".txt") + f"_{page['id']}"
-                candidate = replace(entry, filename=f"{stem}.txt")
-                while candidate.display_path in reserved:
-                    stem += "_"
-                    candidate = replace(entry, filename=f"{stem}.txt")
-                entry = entries[index] = candidate
-                reserved.add(entry.display_path)
-            self._page_cache[entry.display_path] = str(page["id"])
-        entries.sort(key=lambda e: e.display_path)
-        return entries
-
-    def _page_entry(
-        self, page: dict[str, Any], pages_by_id: dict[str, dict[str, Any]]
+    def _entry(
+        self,
+        kind: str,
+        item: dict[str, Any],
+        pages_by_id: dict[str, dict[str, Any]],
     ) -> ManifestEntry:
-        page_id = str(page["id"])
-        title = page["title"]
-        version = page.get("version", {}).get("number", 0)
-        checksum = hashlib.sha256(f"{page_id}:v{version}".encode()).hexdigest()[:16]
-        filename = self._safe_name(title) + ".txt"
-        path = self._page_path(page, pages_by_id)
+        item_id = str(item["id"])
+        title = item["title"]
+        version = item.get("version", {}).get("number", 0)
+        checksum = hashlib.sha256(f"{item_id}:v{version}".encode()).hexdigest()[:16]
+        ext = ".md" if self.format == "markdown" else ".txt"
+        filename = self._safe_name(title) + ext
+        if kind == "page":
+            path = self._page_path(item, pages_by_id)
+            if self.content == "all":
+                path = f"Pages/{path}" if path else "Pages"
+        else:
+            path = self._blog_path(item)
         return ManifestEntry(filename=filename, path=path, checksum=checksum, size=0)
+
+    def _blog_path(self, post: dict[str, Any]) -> str:
+        if self.structure != "hierarchical":
+            return "Blogs"
+        return f"Blogs/{_created_year(post)}"
 
     def _page_path(
         self, page: dict[str, Any], pages_by_id: dict[str, dict[str, Any]]
@@ -249,20 +395,28 @@ class ConfluenceConnector(BaseConnector):
         return f"{path}/{filename}" if path else filename
 
     def read_file(self, path: str, filename: str) -> bytes:
-        """Fetch a page's content and return as text."""
-        page_id = self._page_cache.get(self._entry_key(path, filename))
-        if not page_id:
+        """Fetch a page or blog post and return text or Markdown bytes."""
+        cached = self._content_cache.get(self._entry_key(path, filename))
+        if not cached:
             raise FileNotFoundError(f"Page not found: {filename}")
+        kind, item_id = cached
 
         if self._api_version == "v1":
-            resp = self._http.get(f"/rest/api/content/{page_id}", params={"expand": "body.storage"})
+            resp = self._http.get(f"/rest/api/content/{item_id}", params={"expand": "body.storage"})
         else:
-            resp = self._http.get(f"/api/v2/pages/{page_id}", params={"body-format": "storage"})
+            collection = "pages" if kind == "page" else "blogposts"
+            resp = self._http.get(
+                f"/api/v2/{collection}/{item_id}", params={"body-format": "storage"}
+            )
         resp.raise_for_status()
         data = resp.json()
 
         storage = data.get("body", {}).get("storage", {}).get("value", "")
-        text = _storage_to_text(storage)
+        text = (
+            _storage_to_markdown(storage)
+            if self.format == "markdown"
+            else _storage_to_text(storage)
+        )
         if not text:
             # Open WebUI extracts text as part of POST /files/ and answers 400
             # for a file it can get nothing out of, so uploading this would fail
@@ -284,6 +438,7 @@ def parse_confluence_source(source: str) -> dict[str, str | None]:
         confluence:ENG
         confluence:https://company.atlassian.net/ENG
         confluence:ENG?structure=hierarchical
+        confluence:ENG?content=all&format=markdown
     """
     source = source.removeprefix("confluence:")
     is_url = source.startswith(("http://", "https://"))
@@ -296,15 +451,25 @@ def parse_confluence_source(source: str) -> dict[str, str | None]:
         raise ValueError("Invalid Confluence source. Expected: confluence:SPACEKEY")
 
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    unknown = set(params) - {"structure"}
+    unknown = set(params) - {"structure", "content", "format"}
     if unknown:
         raise ValueError(f"Invalid Confluence source. Unknown parameter: {min(unknown)}")
     structure = params.get("structure", "flat")
     if structure not in {"flat", "hierarchical"}:
         raise ValueError("Invalid Confluence source. Expected structure=flat or structure=hierarchical")
+    content = params.get("content", "pages")
+    if content not in {"pages", "blogs", "all"}:
+        raise ValueError(
+            "Invalid Confluence source. Expected content=pages, content=blogs, or content=all"
+        )
+    fmt = params.get("format", "text")
+    if fmt not in {"text", "markdown"}:
+        raise ValueError("Invalid Confluence source. Expected format=text or format=markdown")
 
     return {
         "base_url": f"{parsed.scheme}://{parsed.netloc}{base_path}" if is_url else None,
         "space_key": space_key,
         "structure": structure,
+        "content": content,
+        "format": fmt,
     }
